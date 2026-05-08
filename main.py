@@ -153,54 +153,87 @@ async def on_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
+
     date_filter = None
     if context.args:
         date_filter = context.args[0]
-    
+
     if date_filter:
         cursor.execute("""
         SELECT sender_name, amount, currency
-        FROM transfers 
+        FROM transfers
         WHERE created_at = ?
-        ORDER BY sender_name
+        ORDER BY currency, sender_name
         """, (date_filter,))
-        
+
         rows = cursor.fetchall()
         conn.close()
-        
+
         if not rows:
             await update.message.reply_text(f"📭 ថ្ងៃ {date_filter} មិនទាន់មានទិន្នន័យ។")
             return
-        
-        report = f"📊 **ថ្ងៃ {date_filter}៖**\n\n"
-        total_amount = 0
-        for sender, amount, curr in rows:
-            symbol = "$" if curr == "USD" else "៛"
-            report += f"👤 {sender}: `{amount}{symbol}`\n"
-            total_amount += float(amount)
-        
-        report += f"\n💰 **សរុប:** `{total_amount:,.2f}`"
+
+        # Group by currency
+        usd_rows = [(s, a) for s, a, c in rows if c == "USD"]
+        khr_rows = [(s, a) for s, a, c in rows if c == "KHR"]
+
+        report = f"📊 **ថ្ងៃ {date_filter}**\n"
+        report += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        if usd_rows:
+            if khr_rows:
+                report += "🇺🇸 **USD**\n"
+            usd_total = 0.0
+            for sender, amount in usd_rows:
+                usd_total += float(amount)
+                report += f"👤 {sender}: `{float(amount):,.2f}$`\n"
+            if khr_rows:
+                report += f"💵 **សរុប USD:** `{usd_total:,.2f}$`\n\n"
+
+        if khr_rows:
+            if usd_rows:
+                report += "🇰🇭 **KHR**\n"
+            khr_total = 0.0
+            for sender, amount in khr_rows:
+                khr_total += float(amount)
+                report += f"👤 {sender}: `{float(amount):,.0f}៛`\n"
+            if usd_rows:
+                report += f"💵 **សរុប KHR:** `{khr_total:,.0f}៛`\n"
+
+        report += "\n━━━━━━━━━━━━━━━━━━━━\n"
+
+        # Grand total line
+        if usd_rows and not khr_rows:
+            usd_total = sum(float(a) for _, a in usd_rows)
+            report += f"💰 **សរុប:** `{usd_total:,.2f}$`"
+        elif khr_rows and not usd_rows:
+            khr_total = sum(float(a) for _, a in khr_rows)
+            report += f"💰 **សរុប:** `{khr_total:,.0f}៛`"
+        else:
+            usd_total = sum(float(a) for _, a in usd_rows)
+            khr_total = sum(float(a) for _, a in khr_rows)
+            report += f"💰 **សរុបទាំងអស់:** `{usd_total:,.2f}$` + `{khr_total:,.0f}៛`"
+
     else:
         cursor.execute("""
         SELECT created_at, currency, SUM(CAST(amount AS DECIMAL))
-        FROM transfers 
-        GROUP BY created_at, currency 
+        FROM transfers
+        GROUP BY created_at, currency
         ORDER BY created_at DESC LIMIT 7
         """)
-        
+
         rows = cursor.fetchall()
         conn.close()
-        
+
         if not rows:
             await update.message.reply_text("📭 មិនទាន់មានទិន្នន័យ។")
             return
-        
+
         report = "📊 **សរុបប្រចាំថ្ងៃ៖**\n\n"
         for dt, curr, total in rows:
             symbol = "$" if curr == "USD" else "៛"
             report += f"📅 {dt}: `{total:,.2f}{symbol}`\n"
-    
+
     await update.message.reply_text(report, parse_mode="Markdown")
 
 if __name__ == '__main__':
