@@ -1,5 +1,6 @@
 import os
 import re
+import datetime
 import sqlite3
 import pandas as pd
 from telegram import Update
@@ -23,35 +24,71 @@ def parse_aba_statement(file_path):
     try:
         df = pd.read_excel(file_path, engine='openpyxl', header=None)
         data_list = []
-        
+
         for _, row in df.iterrows():
-            line = " ".join([str(val) for val in row.values if pd.notna(val)])
-            
-            # រកទឹកប្រាក់
-            amt_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', line)
-            if not amt_match:
+            # Column A (0) = Sender Name, B (1) = Amount, C (2) = Date, D (3) = Currency
+            if len(row) < 2:
                 continue
-            
-            amount = amt_match.group(1).replace(",", "")
-            if float(amount) <= 0:
+
+            # --- Sender Name (column 0) ---
+            raw_name = row.iloc[0]
+            if pd.isna(raw_name) or str(raw_name).strip() == "":
                 continue
-            
-            # រកប្រភេទលុយ
-            curr = "KHR" if any(x in line.upper() for x in ["KHR", "៛", "រៀល"]) else "USD"
-            
-            # រកឈ្មោះអ្នកផ្ទេរ
-            name = "Unknown Sender"
-            name_match = re.search(r'(?:FROM|BY|TRANSFER|PAYMENT)\s+([A-Z\s]{3,30})|([\u1780-\u17FF\s]{3,30})', line, re.I)
-            if name_match:
-                name = (name_match.group(1) or name_match.group(2)).strip()
-                name = re.sub(r'\s+', ' ', name)
-            
-            # រកថ្ងៃខែ
-            date_match = re.search(r'(\d{2}[-/]\w{3}[-/]\d{4})|(\d{4}-\d{2}-\d{2})|(\d{2}/\d{2}/\d{4})', line)
-            dt = date_match.group(0) if date_match else "2026-05-08"
-            
+            name = str(raw_name).strip()
+            name = re.sub(r'\s+', ' ', name)
+
+            # --- Amount (column 1) ---
+            raw_amount = row.iloc[1]
+            if pd.isna(raw_amount):
+                continue
+            # Strip commas and whitespace, then convert to float
+            amount_str = str(raw_amount).replace(",", "").strip()
+            try:
+                amount_val = float(amount_str)
+            except ValueError:
+                continue
+            if amount_val <= 0:
+                continue
+            amount = str(amount_val)
+
+            # --- Date (column 2) ---
+            dt = "2026-05-08"  # fallback
+            if len(row) > 2 and pd.notna(row.iloc[2]):
+                raw_date = row.iloc[2]
+                # pandas may already parse it as a datetime object
+                if hasattr(raw_date, 'strftime'):
+                    dt = raw_date.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(raw_date).strip()
+                    # Try YYYY-MM-DD
+                    m = re.match(r'^(\d{4}-\d{2}-\d{2})', date_str)
+                    if m:
+                        dt = m.group(1)
+                    else:
+                        # Try MM/DD/YYYY or DD/MM/YYYY
+                        m = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', date_str)
+                        if m:
+                            dt = f"{m.group(3)}-{m.group(1)}-{m.group(2)}"
+                        else:
+                            # Try DD-Mon-YYYY (e.g. 08-May-2026)
+                            m = re.match(r'^(\d{2})-([A-Za-z]{3})-(\d{4})$', date_str)
+                            if m:
+                                try:
+                                    dt = datetime.datetime.strptime(date_str, "%d-%b-%Y").strftime("%Y-%m-%d")
+                                except ValueError:
+                                    dt = date_str
+
+            # --- Currency (column 3, optional) ---
+            curr = "USD"
+            if len(row) > 3 and pd.notna(row.iloc[3]):
+                raw_curr = str(row.iloc[3]).strip().upper()
+                if raw_curr in ("KHR", "USD"):
+                    curr = raw_curr
+                elif any(x in raw_curr for x in ["KHR", "៛", "រៀល"]):
+                    curr = "KHR"
+
             data_list.append((dt, name, amount, curr))
-        
+
         return data_list
     except Exception as e:
         print(f"Error parsing file: {e}")
