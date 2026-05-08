@@ -1,12 +1,12 @@
 import os
 import re
+import datetime
 import sqlite3
 import pandas as pd
-import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- កំណត់ផ្លូវ Database (សម្រាប់ Railway គួរប្រើ /app/data/ បើមាន Volume) ---
+# កំណត់ផ្លូវ Database
 DB_FILE = "aba_database.db"
 
 def init_db():
@@ -21,139 +21,135 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- មុខងារអាន ABA Excel ---
 def parse_aba_statement(file_path):
     try:
-        # អាន Excel ដោយប្រើ engine openpyxl
+        # អាន Excel ដោយមិនកំណត់ Header ដើម្បីស្កេនគ្រប់ជួរ
         df = pd.read_excel(file_path, engine='openpyxl', header=None)
         data_list = []
         
         for idx, row in df.iterrows():
-            # បំប្លែងជួរនីមួយៗជា Text ដើម្បីស្កេនរកទិន្នន័យ
-            line = " ".join([str(val) for val in row.values if pd.notna(val)])
+            # បំប្លែងជួរដេកទាំងមូលទៅជាអត្ថបទ (Text) តែមួយដើម្បីស្រួលរក
+            line_text = " ".join([str(val) for val in row.values if pd.notna(val)])
             
-            # ១. រកទឹកប្រាក់ (Amount)
-            amt_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', line)
-            if not amt_match: continue
+            # ១. ស្វែងរកទឹកប្រាក់ (Amount) - រកលេខដែលមានចុច .00
+            amt_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', line_text)
+            if not amt_match:
+                continue
             
             amount = amt_match.group(1).replace(",", "")
-            if float(amount) <= 0: continue
+            if float(amount) <= 0:
+                continue
             
-            # ២. រកប្រភេទលុយ (Currency)
-            curr = "KHR" if any(x in line.upper() for x in ["KHR", "៛", "រៀល"]) else "USD"
-            
-            # ៣. រកឈ្មោះអ្នកផ្ញើ (English & Khmer)
+            # ២. ស្វែងរកឈ្មោះ (Sender Name)
+            # ABA Statement ច្រើនប្រើពាក្យ 'Transfer from', 'Payment from' ឬ 'រៀបរាប់'
             name = "Unknown Sender"
-            name_pat = re.search(r'(?:FROM|BY|TRANSFER|PAYMENT)\s+([A-Z\s]{3,30})|([\u1780-\u17FF\s]{3,30})', line, re.I)
-            if name_pat:
-                name = (name_pat.group(1) or name_pat.group(2)).strip()
-                name = re.sub(r'\s+', ' ', name)
+            # រកឈ្មោះជាភាសាអង់គ្លេស (អក្សរធំ) ឬភាសាខ្មែរ បន្ទាប់ពីពាក្យគន្លឹះ
+            name_match = re.search(r'(?:FROM|BY|TRANSFER|PAYMENT)\s+([A-Z\s]{3,})|([\u1780-\u17FF\s]{3,})', line_text, re.I)
+            if name_match:
+                # យក Group ណាមួយដែលរកឃើញ (អង់គ្លេស ឬ ខ្មែរ)
+                found_name = (name_match.group(1) or name_match.group(2)).strip()
+                # សម្អាតឈ្មោះ (លុបពាក្យដែលមិនមែនជាឈ្មោះចេញ)
+                if len(found_name) > 3:
+                    name = re.sub(r'\s+', ' ', found_name)
 
-            # ៤. រកថ្ងៃខែ
-            date_match = re.search(r'(\d{2}[-/]\w{3}[-/]\d{4})|(\d{4}-\d{2}-\d{2})|(\d{2}/\d{2}/\d{4})', line)
-            dt = date_match.group(0) if date_match else datetime.datetime.now().strftime("%Y-%m-%d")
+            # ៣. ស្វែងរកកាលបរិច្ឆេទ (Date)
+            dt = datetime.datetime.now().strftime("%Y-%m-%d")
+            date_match = re.search(r'(\d{2}[-/]\w{3}[-/]\d{4})|(\d{4}-\d{2}-\d{2})|(\d{2}/\d{2}/\d{4})', line_text)
+            if date_match:
+                raw_d = date_match.group(0).replace("/", "-")
+                try:
+                    # បើជាទម្រង់ 08-May-2026
+                    if "-" in raw_d and any(x.isalpha() for x in raw_d):
+                        dt = datetime.datetime.strptime(raw_d, "%d-%b-%Y").strftime("%Y-%m-%d")
+                    else:
+                        dt = raw_d
+                except: pass
 
+            # ៤. រកប្រភេទលុយ (Currency)
+            curr = "KHR" if any(x in line_text.upper() for x in ["KHR", "៛", "រៀល"]) else "USD"
+            
             data_list.append((dt, name, amount, curr))
         
         return data_list
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error parsing file: {e}")
         return []
 
-# --- បញ្ជា /start ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 **ABA Smart Bot ដំណើរការហើយ!**\n\n"
-        "📤 សូមផ្ញើឯកសារ ABA Excel (.xlsx) មកកាន់ខ្ញុំ\n"
-        "📊 ប្រើ /summary ដើម្បីមើលរបាយការណ៍"
-    )
+# --- មុខងារបង្ហាញរបាយការណ៍ឱ្យស្អាតដូចក្នុងរូបភាព ---
+async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
 
-# --- ទទួល File Excel ---
+    # បើអត់ដាក់ថ្ងៃ គឺយកថ្ងៃនេះ
+    target_date = context.args[0] if context.args else datetime.datetime.now().strftime("%Y-%m-%d")
+
+    cursor.execute("SELECT sender_name, amount, currency FROM transfers WHERE created_at LIKE ?", (f"{target_date}%",))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text(f"📊 ថ្ងៃ `{target_date}` មិនទាន់មានទិន្នន័យផ្ទេរចូលទេ។")
+        return
+
+    # រៀបចំសារបង្ហាញ
+    report = f"📊 **ថ្ងៃ {target_date}**\n"
+    report += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    total_usd = 0.0
+    total_khr = 0.0
+    
+    for name, amt, curr in rows:
+        amt_float = float(amt)
+        if curr == "USD":
+            total_usd += amt_float
+            report += f"👤 {name}: `{amt_float:,.2f}$`\n"
+        else:
+            total_khr += amt_float
+            report += f"👤 {name}: `{amt_float:,.0f}៛`\n"
+
+    report += "\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if total_usd > 0 and total_khr > 0:
+        report += f"💰 **សរុប:** `{total_usd:,.2f}$` + `{total_khr:,.0f}៛`"
+    elif total_usd > 0:
+        report += f"💰 **សរុប:** `{total_usd:,.2f}$`"
+    else:
+        report += f"💰 **សរុប:** `{total_khr:,.0f}៛`"
+
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+# (ផ្នែក handle_document និង main រក្សាទុកដូចដើម ប៉ុន្តែប្តូរ TOKEN)
 async def on_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-        return
+    if not doc.file_name.lower().endswith(('.xlsx', '.xls')): return
     
     msg = await update.message.reply_text("⏳ កំពុងវិភាគ Statement...")
     temp_name = f"temp_{doc.file_id}.xlsx"
     file = await context.bot.get_file(doc.file_id)
     await file.download_to_drive(temp_name)
 
-    try:
-        results = parse_aba_statement(temp_name)
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        count = 0
-        for dt, nm, am, cr in results:
-            cursor.execute("SELECT 1 FROM transfers WHERE sender_name=? AND amount=? AND created_at=?", (nm, am, dt))
-            if not cursor.fetchone():
-                cursor.execute("INSERT INTO transfers (created_at, sender_name, amount, currency) VALUES (?,?,?,?)", (dt, nm, am, cr))
-                count += 1
-        conn.commit()
-        conn.close()
-        await msg.edit_text(f"✅ រក្សាទុកបាន `{count}` ប្រតិបត្តិការថ្មី!")
-    except Exception as e:
-        await msg.edit_text(f"❌ កំហុស៖ {str(e)}")
-    finally:
-        if os.path.exists(temp_name): os.remove(temp_name)
-
-# --- បង្ហាញរបាយការណ៍ស្អាត (Summary) ---
-async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    # យកថ្ងៃនេះជាគោល បើអ្នកប្រើមិនបានវាយបញ្ជាក់ថ្ងៃ
-    target_date = context.args[0] if context.args else datetime.datetime.now().strftime("%Y-%m-%d")
-
-    cursor.execute("SELECT sender_name, amount, currency FROM transfers WHERE created_at = ?", (target_date,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text(f"📭 ថ្ងៃ `{target_date}` មិនទាន់មានទិន្នន័យទេ។")
+    results = parse_aba_statement(temp_name)
+    if not results:
+        await msg.edit_text("❌ មិនអាចអានទិន្នន័យបានទេ។ សូមពិនិត្យមើលថា File មាន Password ឬអត់?")
         return
 
-    # បែងចែក USD និង KHR
-    usd_list = [(n, float(a)) for n, a, c in rows if c == "USD"]
-    khr_list = [(n, float(a)) for n, a, c in rows if c == "KHR"]
-
-    # បង្កើតសាររបាយការណ៍
-    report = f"📊 **ថ្ងៃ {target_date}**\n"
-    report += "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    total_usd = 0
-    for name, amt in usd_list:
-        total_usd += amt
-        report += f"👤 {name}:  `{amt:,.2f}$`\n"
-
-    if khr_list:
-        if usd_list: report += "\n" + "━" * 15 + "\n"
-        total_khr = 0
-        for name, amt in khr_list:
-            total_khr += amt
-            report += f"👤 {name}:  `{amt:,.0f}៛`\n"
-
-    report += "\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    # បូកសរុបចុងក្រោយ
-    if usd_list and not khr_list:
-        report += f"💰 **សរុប:  {total_usd:,.2f}$**"
-    elif khr_list and not usd_list:
-        report += f"💰 **សរុប:  {total_khr:,.0f}៛**"
-    else:
-        report += f"💰 **សរុប:** `{total_usd:,.2f}$` + `{total_khr:,.0f}៛`"
-
-    await update.message.reply_text(report, parse_mode="Markdown")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    count = 0
+    for dt, nm, am, cr in results:
+        cursor.execute("SELECT 1 FROM transfers WHERE sender_name=? AND amount=? AND created_at=?", (nm, am, dt))
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO transfers (created_at, sender_name, amount, currency) VALUES (?,?,?,?)", (dt, nm, am, cr))
+            count += 1
+    conn.commit()
+    conn.close()
+    await msg.edit_text(f"✅ បានរក្សាទុក `{count}` ប្រតិបត្តិការថ្មី!")
+    if os.path.exists(temp_name): os.remove(temp_name)
 
 if __name__ == '__main__':
     init_db()
-    # ទាញយក Token ពី Environment Variable ក្នុង Railway (ឈ្មោះ BOT_TOKEN)
-    TOKEN = os.getenv("BOT_TOKEN") 
+    TOKEN = "8663484036:AAEZmsFkVkZdxXNHy4G1Vzj66NScGnIYNpE"
     app = ApplicationBuilder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("summary", show_summary))
     app.add_handler(MessageHandler(filters.Document.ALL, on_receive_file))
-    
-    print("🚀 Bot is running...")
     app.run_polling()
