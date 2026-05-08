@@ -13,63 +13,76 @@ from telegram.ext import (
     filters,
 )
 
-# =========================================================
+# =====================================================
 # CONFIG
-# =========================================================
+# =====================================================
 
-TOKEN = os.getenv("BOT_TOKEN")  # ដាក់ Token ក្នុង Environment Variable
+TOKEN = os.getenv("BOT_TOKEN")
 DB_FILE = "aba_database.db"
 
-# =========================================================
+# =====================================================
 # DATABASE
-# =========================================================
+# =====================================================
 
 def init_db():
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS transfers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT,
-            sender_name TEXT,
-            amount REAL,
-            currency TEXT
-        )
+    CREATE TABLE IF NOT EXISTS transfers (
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        created_at TEXT,
+        sender_name TEXT,
+        amount REAL,
+        currency TEXT,
+
+        UNIQUE(created_at, sender_name, amount)
+
+    )
     """)
 
     conn.commit()
     conn.close()
 
-# =========================================================
+# =====================================================
 # CLEAN TEXT
-# =========================================================
+# =====================================================
 
 def clean_text(text):
+
     text = str(text)
+
     text = re.sub(r'\s+', ' ', text)
+
     return text.strip()
 
-# =========================================================
+# =====================================================
 # EXTRACT NAME
-# =========================================================
+# =====================================================
 
 def extract_name(text):
 
     text = clean_text(text)
 
     patterns = [
+
         r'(?:FROM|BY|TRFR|PAYMENT FROM|TRANSFER FROM|ពី)\s+([A-Za-z\s]{3,})',
+
         r'([\u1780-\u17FF\s]{3,})'
+
     ]
 
     for pattern in patterns:
+
         match = re.search(pattern, text, re.I)
 
         if match:
+
             name = clean_text(match.group(1))
 
-            # កាត់ពាក្យដែលមិនចាំបាច់
             blacklist = [
                 "USD",
                 "KHR",
@@ -81,6 +94,7 @@ def extract_name(text):
             valid = True
 
             for bad in blacklist:
+
                 if bad.lower() in name.lower():
                     valid = False
                     break
@@ -90,29 +104,59 @@ def extract_name(text):
 
     return "Unknown Sender"
 
-# =========================================================
+# =====================================================
 # EXTRACT DATE
-# =========================================================
+# =====================================================
 
-def extract_date(text):
+def extract_date(value):
 
-    patterns = [
-        r'(\d{4}-\d{2}-\d{2})',
-        r'(\d{2}/\d{2}/\d{4})',
-        r'(\d{2}-\d{2}-\d{4})'
-    ]
+    try:
 
-    for pattern in patterns:
-        match = re.search(pattern, text)
+        # Excel datetime
+        if isinstance(value, (datetime.datetime, pd.Timestamp)):
+
+            return value.strftime("%Y-%m-%d")
+
+        text = str(value).strip()
+
+        # YYYY-MM-DD
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
 
         if match:
-            return match.group(1).replace("/", "-")
+            return match.group(1)
 
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+        # DD/MM/YYYY
+        match = re.search(r'(\d{2}/\d{2}/\d{4})', text)
 
-# =========================================================
+        if match:
+
+            dt = datetime.datetime.strptime(
+                match.group(1),
+                "%d/%m/%Y"
+            )
+
+            return dt.strftime("%Y-%m-%d")
+
+        # DD-MM-YYYY
+        match = re.search(r'(\d{2}-\d{2}-\d{4})', text)
+
+        if match:
+
+            dt = datetime.datetime.strptime(
+                match.group(1),
+                "%d-%m-%Y"
+            )
+
+            return dt.strftime("%Y-%m-%d")
+
+    except:
+        pass
+
+    return None
+
+# =====================================================
 # EXTRACT AMOUNT
-# =========================================================
+# =====================================================
 
 def extract_amount(row):
 
@@ -126,6 +170,7 @@ def extract_amount(row):
         text = str(val).replace(",", "").strip()
 
         try:
+
             num = float(text)
 
             if num > 0:
@@ -137,12 +182,11 @@ def extract_amount(row):
     if not numbers:
         return None
 
-    # យកលេខធំបំផុតក្នុង row
     return max(numbers)
 
-# =========================================================
+# =====================================================
 # DETECT CURRENCY
-# =========================================================
+# =====================================================
 
 def detect_currency(text):
 
@@ -153,9 +197,9 @@ def detect_currency(text):
 
     return "USD"
 
-# =========================================================
+# =====================================================
 # PARSE ABA STATEMENT
-# =========================================================
+# =====================================================
 
 def parse_aba_statement(file_path):
 
@@ -187,7 +231,20 @@ def parse_aba_statement(file_path):
             name = extract_name(row_text)
 
             # Date
-            date = extract_date(row_text)
+            date = None
+
+            for val in row.values:
+
+                date = extract_date(val)
+
+                if date:
+                    break
+
+            if not date:
+
+                date = datetime.datetime.now().strftime(
+                    "%Y-%m-%d"
+                )
 
             # Currency
             currency = detect_currency(row_text)
@@ -202,54 +259,59 @@ def parse_aba_statement(file_path):
         return results
 
     except Exception as e:
+
         print("PARSE ERROR:", e)
+
         return []
 
-# =========================================================
-# SAVE TO DATABASE
-# =========================================================
+# =====================================================
+# SAVE DATABASE
+# =====================================================
 
 def save_to_db(data):
 
     conn = sqlite3.connect(DB_FILE)
+
     cursor = conn.cursor()
 
-    new_count = 0
+    count = 0
 
     for dt, name, amount, currency in data:
 
-        cursor.execute("""
-            SELECT 1
-            FROM transfers
-            WHERE created_at=?
-            AND sender_name=?
-            AND amount=?
-        """, (dt, name, amount))
-
-        exists = cursor.fetchone()
-
-        if not exists:
+        try:
 
             cursor.execute("""
                 INSERT INTO transfers (
+
                     created_at,
                     sender_name,
                     amount,
                     currency
+
                 )
                 VALUES (?, ?, ?, ?)
-            """, (dt, name, amount, currency))
+            """, (
+                dt,
+                name,
+                amount,
+                currency
+            ))
 
-            new_count += 1
+            count += 1
+
+        except sqlite3.IntegrityError:
+
+            pass
 
     conn.commit()
+
     conn.close()
 
-    return new_count
+    return count
 
-# =========================================================
-# SUMMARY COMMAND
-# =========================================================
+# =====================================================
+# SUMMARY
+# =====================================================
 
 async def show_summary(
     update: Update,
@@ -263,13 +325,19 @@ async def show_summary(
     )
 
     conn = sqlite3.connect(DB_FILE)
+
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT sender_name, amount, currency
+        SELECT
+            sender_name,
+            amount,
+            currency
+
         FROM transfers
-        WHERE created_at LIKE ?
-    """, (f"%{target_date}%",))
+
+        WHERE DATE(created_at)=DATE(?)
+    """, (target_date,))
 
     rows = cursor.fetchall()
 
@@ -284,6 +352,7 @@ async def show_summary(
         return
 
     report = f"📊 <b>ថ្ងៃ {target_date}</b>\n"
+
     report += "━━━━━━━━━━━━━━━━━━\n\n"
 
     total_usd = 0
@@ -316,9 +385,11 @@ async def show_summary(
     report += "💰 <b>សរុប:</b> "
 
     if total_usd > 0:
+
         report += f"<code>{total_usd:,.2f}$</code> "
 
     if total_khr > 0:
+
         report += f"+ <code>{total_khr:,.0f}៛</code>"
 
     await update.message.reply_text(
@@ -326,9 +397,9 @@ async def show_summary(
         parse_mode="HTML"
     )
 
-# =========================================================
+# =====================================================
 # RECEIVE FILE
-# =========================================================
+# =====================================================
 
 async def on_receive_file(
     update: Update,
@@ -337,10 +408,13 @@ async def on_receive_file(
 
     doc = update.message.document
 
-    if not doc.file_name.lower().endswith((".xlsx", ".xls")):
+    if not doc.file_name.lower().endswith((
+        ".xlsx",
+        ".xls"
+    )):
 
         await update.message.reply_text(
-            "❌ សូមផ្ញើ Excel File (.xlsx/.xls)"
+            "❌ សូមផ្ញើ Excel File"
         )
 
         return
@@ -353,24 +427,30 @@ async def on_receive_file(
 
     try:
 
-        file = await context.bot.get_file(doc.file_id)
+        file = await context.bot.get_file(
+            doc.file_id
+        )
 
-        await file.download_to_drive(temp_file)
+        await file.download_to_drive(
+            temp_file
+        )
 
-        results = parse_aba_statement(temp_file)
+        results = parse_aba_statement(
+            temp_file
+        )
 
         if not results:
 
             await loading.edit_text(
-                "❌ មិនអាចអានទិន្នន័យបានទេ។"
+                "❌ មិនអាចអានទិន្នន័យបានទេ"
             )
 
             return
 
-        new_count = save_to_db(results)
+        count = save_to_db(results)
 
         await loading.edit_text(
-            f"✅ បានរកឃើញ {new_count} ប្រតិបត្តិការថ្មី"
+            f"✅ បានបញ្ចូល {count} ប្រតិបត្តិការថ្មី!"
         )
 
     except Exception as e:
@@ -384,9 +464,9 @@ async def on_receive_file(
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-# =========================================================
-# START COMMAND
-# =========================================================
+# =====================================================
+# START
+# =====================================================
 
 async def start(
     update: Update,
@@ -396,25 +476,27 @@ async def start(
     text = """
 🤖 ABA Statement Bot
 
-📥 ផ្ញើ Excel ABA Statement
-📊 ប្រើ /summary ដើម្បីមើលរបាយការណ៍
+📥 ផ្ញើ ABA Excel Statement
 
-ឧទាហរណ៍:
-    /summary
-    /summary 2026-05-08
+📊 Commands:
+
+/summary
+/summa
+ry 2026-05-08
 """
 
     await update.message.reply_text(text)
 
-# =========================================================
+# =====================================================
 # MAIN
-# =========================================================
+# =====================================================
 
 def main():
 
     init_db()
 
     if not TOKEN:
+
         print("❌ BOT_TOKEN not found")
         return
 
@@ -424,8 +506,19 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("summary", show_summary))
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "summary",
+            show_summary
+        )
+    )
 
     app.add_handler(
         MessageHandler(
@@ -434,11 +527,11 @@ def main():
         )
     )
 
-    print("🚀 ABA BOT RUNNING...")
+    print("🚀 BOT RUNNING...")
 
     app.run_polling()
 
-# =========================================================
+# =====================================================
 
 if __name__ == "__main__":
     main()
