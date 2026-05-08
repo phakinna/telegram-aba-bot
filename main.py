@@ -1,5 +1,6 @@
 import os
 import re
+import datetime
 import sqlite3
 import pandas as pd
 from telegram import Update
@@ -24,31 +25,74 @@ def parse_aba_statement(file_path):
         df = pd.read_excel(file_path, engine='openpyxl', header=None)
         data_list = []
         
-        for _, row in df.iterrows():
-            line = " ".join([str(val) for val in row.values if pd.notna(val)])
-            
-            # រកទឹកប្រាក់
-            amt_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', line)
-            if not amt_match:
+        # Skip header row (row 0), start from row 1
+        for idx, row in df.iterrows():
+            if idx == 0:  # Skip header
                 continue
             
-            amount = amt_match.group(1).replace(",", "")
-            if float(amount) <= 0:
+            # Column A (0) = Date, B (1) = Transaction Details, C (2) = Money in, D (3) = Ccy
+            if len(row) < 3:
                 continue
             
-            # រកប្រភេទលុយ
-            curr = "KHR" if any(x in line.upper() for x in ["KHR", "៛", "រៀល"]) else "USD"
+            # --- Date (column A, index 0) ---
+            raw_date = row.iloc[0]
+            if pd.isna(raw_date):
+                continue
             
-            # រកឈ្មោះអ្នកផ្ទេរ
-            name = "Unknown Sender"
-            name_match = re.search(r'(?:FROM|BY|TRANSFER|PAYMENT)\s+([A-Z\s]{3,30})|([\u1780-\u17FF\s]{3,30})', line, re.I)
-            if name_match:
-                name = (name_match.group(1) or name_match.group(2)).strip()
-                name = re.sub(r'\s+', ' ', name)
+            dt = "2026-05-08"  # fallback
+            if hasattr(raw_date, 'strftime'):
+                dt = raw_date.strftime("%Y-%m-%d")
+            else:
+                date_str = str(raw_date).strip()
+                # Try YYYY-MM-DD
+                m = re.match(r'^(\d{4}-\d{2}-\d{2})', date_str)
+                if m:
+                    dt = m.group(1)
+                else:
+                    # Try DD/MM/YYYY
+                    m = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', date_str)
+                    if m:
+                        dt = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+                    else:
+                        # Try DD-Mon-YYYY
+                        m = re.match(r'^(\d{2})-([A-Za-z]{3})-(\d{4})$', date_str)
+                        if m:
+                            try:
+                                dt = datetime.datetime.strptime(date_str, "%d-%b-%Y").strftime("%Y-%m-%d")
+                            except ValueError:
+                                dt = date_str
             
-            # រកថ្ងៃខែ
-            date_match = re.search(r'(\d{2}[-/]\w{3}[-/]\d{4})|(\d{4}-\d{2}-\d{2})|(\d{2}/\d{2}/\d{4})', line)
-            dt = date_match.group(0) if date_match else "2026-05-08"
+            # --- Sender Name (column B, index 1) ---
+            raw_name = row.iloc[1]
+            if pd.isna(raw_name) or str(raw_name).strip() == "":
+                continue
+            name = str(raw_name).strip()
+            name = re.sub(r'\s+', ' ', name)
+            
+            # --- Amount (column C, index 2) ---
+            raw_amount = row.iloc[2]
+            if pd.isna(raw_amount):
+                continue
+            
+            amount_str = str(raw_amount).replace(",", "").strip()
+            try:
+                amount_val = float(amount_str)
+            except ValueError:
+                continue
+            
+            if amount_val <= 0:
+                continue
+            
+            amount = str(amount_val)
+            
+            # --- Currency (column D, index 3) ---
+            curr = "USD"  # default
+            if len(row) > 3 and pd.notna(row.iloc[3]):
+                raw_curr = str(row.iloc[3]).strip().upper()
+                if raw_curr in ("KHR", "USD"):
+                    curr = raw_curr
+                elif any(x in raw_curr for x in ["KHR", "៛", "រៀល"]):
+                    curr = "KHR"
             
             data_list.append((dt, name, amount, curr))
         
@@ -110,13 +154,11 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # ប្រសិនបើមានថ្ងៃក្នុង argument
     date_filter = None
     if context.args:
         date_filter = context.args[0]
     
     if date_filter:
-        # លម្អិតថ្ងៃជាក់លាក់
         cursor.execute("""
         SELECT sender_name, amount, currency
         FROM transfers 
@@ -140,7 +182,6 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         report += f"\n💰 **សរុប:** `{total_amount:,.2f}`"
     else:
-        # សរុបប្រចាំថ្ងៃ (7 ថ្ងៃចុងក្រោយ)
         cursor.execute("""
         SELECT created_at, currency, SUM(CAST(amount AS DECIMAL))
         FROM transfers 
