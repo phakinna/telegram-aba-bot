@@ -6,7 +6,7 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- កំណត់ផ្លូវ Database ---
+# --- ផ្លូវ Database ---
 DB_FILE = "aba_database.db"
 
 def init_db():
@@ -21,52 +21,57 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- មុខងារស្រង់ទិន្នន័យ (Fix: ស្រង់ឈ្មោះ និងទឹកប្រាក់ម្នាក់ៗ) ---
+# --- មុខងារ Fix ថ្មី៖ ស្រង់ឈ្មោះ និងទឹកប្រាក់ដោយឆ្លាតវៃ ---
 def parse_aba_statement(file_path):
     try:
-        # អាន Excel ដោយប្រើ engine openpyxl
+        # អាន Excel ដោយមិនយក Header ដើម្បីស្កេនរកទិន្នន័យដោយខ្លួនឯង
         df = pd.read_excel(file_path, engine='openpyxl', header=None)
         data_list = []
         
         for idx, row in df.iterrows():
-            # បំប្លែងជួរនីមួយៗជាអត្ថបទដើម្បីស្កេនរក Regex
+            # បំប្លែងជួរដេកទាំងមូលទៅជា Text ដើម្បីស្កេនរកពាក្យគន្លឹះ
             line_text = " ".join([str(val) for val in row.values if pd.notna(val)])
             
-            # ១. រកទឹកប្រាក់ (Amount) - រកលេខដែលមានចុច .00
+            # ១. ស្វែងរកទឹកប្រាក់ (Amount) - រកលេខដែលមានចុច .00
             amt_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2}))', line_text)
-            if not amt_match: continue
+            if not amt_match:
+                continue
             
             amount = amt_match.group(1).replace(",", "")
-            if float(amount) <= 0: continue
+            if float(amount) <= 0:
+                continue
             
-            # ២. រកឈ្មោះអ្នកផ្ញើ (Sender Name)
+            # ២. ស្វែងរកឈ្មោះ (Sender Name) - ស្កេនរកអក្សរធំ ឬអក្សរខ្មែរ
             name = "Unknown Sender"
-            # ស្កេនរកអក្សរធំ (English) ឬអក្សរខ្មែរ បន្ទាប់ពីពាក្យគន្លឹះ ABA
-            name_match = re.search(r'(?:FROM|BY|TRFR|PAYMENT|TRANSFER)\s+([A-Z\s]{3,})|([\u1780-\u17FF\s]{3,})', line_text, re.I)
+            # រកឈ្មោះបន្ទាប់ពីពាក្យគន្លឹះដែល ABA ប្រើក្នុង Statement
+            name_match = re.search(r'(?:FROM|BY|TRFR|PAYMENT|រៀបរាប់|ពី)\s+([A-Z\s]{3,})|([\u1780-\u17FF\s]{3,})', line_text, re.I)
             if name_match:
                 found_name = (name_match.group(1) or name_match.group(2)).strip()
                 if len(found_name) > 3:
                     name = re.sub(r'\s+', ' ', found_name)
 
-            # ៣. រកថ្ងៃខែ
+            # ៣. ស្វែងរកកាលបរិច្ឆេទ (Date)
             dt = datetime.datetime.now().strftime("%Y-%m-%d")
-            date_match = re.search(r'(\d{2}[-/]\d{2}[-/]\d{4})|(\d{4}-\d{2}-\d{2})', line_text)
+            date_match = re.search(r'(\d{2}[-/]\d{2}[-/]\d{4})|(\d{4}-\d{2}-\d{2})|(\d{2}[-/][A-Za-z]{3}[-/]\d{4})', line_text)
             if date_match:
                 dt = date_match.group(0).replace("/", "-")
 
-            # ៤. រកប្រភេទលុយ
+            # ៤. រកប្រភេទលុយ (Currency)
             curr = "KHR" if any(x in line_text.upper() for x in ["KHR", "៛", "រៀល"]) else "USD"
             
             data_list.append((dt, name, amount, curr))
+        
         return data_list
     except Exception as e:
         print(f"Error: {e}")
         return []
 
-# --- មុខងារបង្ហាញរបាយការណ៍ (Fix: បង្ហាញតាមទម្រង់រូបភាព) ---
+# --- បង្ហាញរបាយការណ៍ស្អាតដូចរូបភាព ---
 async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
+    # បើមិនវាយថ្ងៃ គឺយកថ្ងៃបច្ចុប្បន្ន
     target_date = context.args[0] if context.args else datetime.datetime.now().strftime("%Y-%m-%d")
 
     cursor.execute("SELECT sender_name, amount, currency FROM transfers WHERE created_at LIKE ?", (f"%{target_date}%",))
@@ -74,9 +79,10 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text(f"📊 ថ្ងៃ `{target_date}` មិនទាន់មានទិន្នន័យទេ។")
+        await update.message.reply_text(f"📊 ថ្ងៃ `{target_date}` មិនមានទិន្នន័យទេ។")
         return
 
+    # កំណត់ទម្រង់សារដូចក្នុងរូបភាព
     report = f"📊 **ថ្ងៃ {target_date}**\n"
     report += "━━━━━━━━━━━━━━━━━━━━\n\n"
     
@@ -110,7 +116,7 @@ async def on_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = parse_aba_statement(temp_name)
     if not results:
-        await msg.edit_text("❌ មិនអាចអានទិន្នន័យបានទេ។ សូមឆែកមើល File Excel ឡើងវិញ។")
+        await msg.edit_text("❌ មិនអាចអានទិន្នន័យបានទេ។ សូមពិនិត្យ File ឡើងវិញ។")
         return
 
     conn = sqlite3.connect(DB_FILE)
@@ -124,13 +130,16 @@ async def on_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    await msg.edit_text(f"✅ រកឃើញ និងរក្សាទុកបាន `{count}` ប្រតិបត្តិការថ្មី!")
+    await msg.edit_text(f"✅ រកឃើញ `{count}` ប្រតិបត្តិការថ្មី!")
     if os.path.exists(temp_name): os.remove(temp_name)
 
 if __name__ == '__main__':
     init_db()
     TOKEN = "8663484036:AAEZmsFkVkZdxXNHy4G1Vzj66NScGnIYNpE" #
     app = ApplicationBuilder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("summary", show_summary))
     app.add_handler(MessageHandler(filters.Document.ALL, on_receive_file))
+    
+    print("🚀 Bot Fixed & Running...")
     app.run_polling()
