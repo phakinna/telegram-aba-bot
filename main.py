@@ -1,277 +1,154 @@
 import os
+import re
 import sqlite3
 import pandas as pd
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes
-)
+from decimal import Decimal
+from datetime import datetime
 
-# =========================
-# TOKEN
-# =========================
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-TOKEN = "ដាក់_BOT_TOKEN_នៅទីនេះ"
+# =========================================================
+# CONFIG
+# =========================================================
+TOKEN = os.getenv("BOT_TOKEN")
 
-DB_FILE = "aba.db"
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN not found!")
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
+DB_FILE = "payway_bot.db"
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    sender_name TEXT,
+    amount REAL,
+    currency TEXT
+)
+""")
+conn.commit()
 
-def init_db():
-
-    conn = sqlite3.connect(DB_FILE)
-
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS transfers (
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        sender TEXT,
-        amount REAL
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-# =========================
-# SAVE DATA
-# =========================
-
-def save_data(name, amount):
-
-    conn = sqlite3.connect(DB_FILE)
-
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    INSERT INTO transfers (
-        sender,
-        amount
-    )
-    VALUES (?, ?)
-    """, (name, amount))
-
-    conn.commit()
-    conn.close()
-
-# =========================
-# READ EXCEL
-# =========================
-
-def parse_excel(file_path):
-
-    data = []
-
-    df = pd.read_excel(
-        file_path,
-        engine="openpyxl"
-    )
-
-    for _, row in df.iterrows():
-
-        row_text = " ".join([
-            str(x)
-            for x in row.values
-        ])
-
-        # រក Amount
-        amount = None
-
-        for val in row.values:
-
-            try:
-
-                num = float(
-                    str(val).replace(",", "")
-                )
-
-                if num > 0:
-
-                    amount = num
-                    break
-
-            except:
-                pass
-
-        if not amount:
+# =========================================================
+# PARSER (សម្រាប់សារ + XLSX)
+# =========================================================
+def parse_text(text: str):
+    transactions = []
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
 
-        # ឈ្មោះ
-        words = row_text.split()
+        # ស្រង់ទឹកប្រាក់
+        amount_match = re.search(r'ORIGINAL AMOUNT\s+([\d,]+\.?\d*)\s*USD', line, re.IGNORECASE)
+        if not amount_match:
+            amount_match = re.search(r'([\$៛])\s?([\d,]+(?:\.\d+)?)', line)
 
-        name = "Unknown"
+        # ស្រង់ឈ្មោះ
+        name_match = re.search(r'FROM\s+(.+?)\s*\(', line, re.IGNORECASE)
+        if not name_match:
+            name_match = re.search(r'PAYMENT FROM\s+(.+?)\s', line, re.IGNORECASE)
+        if not name_match:
+            name_match = re.search(r'paid by\s+(.+?)\s', line, re.IGNORECASE)
 
-        if len(words) >= 2:
-            name = words[0] + " " + words[1]
+        if not amount_match or not name_match:
+            continue
 
-        data.append((
-            name,
-            amount
-        ))
+        amount_str = amount_match.group(1).replace(",", "") if 'ORIGINAL AMOUNT' in line else amount_match.group(2).replace(",", "")
+        name = name_match.group(1).strip()
 
-    return data
+        try:
+            amount = Decimal(amount_str)
+            transactions.append({"name": name, "amount": amount, "currency": "USD"})
+        except:
+            continue
+    return transactions
 
-# =========================
-# RECEIVE FILE
-# =========================
-
-async def receive_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    doc = update.message.document
-
-    if not doc.file_name.endswith(".xlsx"):
-
-        await update.message.reply_text(
-            "សូមផ្ញើ Excel File"
-        )
-
+# =========================================================
+# HANDLE FILE XLSX
+# =========================================================
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if not document.file_name.lower().endswith('.xlsx'):
+        await update.message.reply_text("❌ គាំទ្រតែ File .xlsx បច្ចុប្បន្ន។")
         return
 
-    msg = await update.message.reply_text(
-        "កំពុងវិភាគ..."
-    )
+    await update.message.reply_text("📥 កំពុងវិភាគ Statement...")
 
-    file = await context.bot.get_file(
-        doc.file_id
-    )
+    file = await context.bot.get_file(document.file_id)
+    temp_path = "temp.xlsx"
+    await file.download_to_drive(temp_path)
 
-    temp = "temp.xlsx"
+    try:
+        df = pd.read_excel(temp_path)
+        count = 0
 
-    await file.download_to_drive(temp)
+        for _, row in df.iterrows():
+            name = str(row.get('sender_name', row.get('Name', row.get(1, 'Unknown'))))
+            amount_str = str(row.get('amount', row.get('Amount', row.get(2, '0'))))
 
-    rows = parse_excel(temp)
+            amount_clean = re.sub(r'[^0-9.]', '', amount_str)
+            try:
+                amount = Decimal(amount_clean)
+                if amount > 0:
+                    cursor.execute("""
+                    INSERT INTO transfers (date, sender_name, amount, currency)
+                    VALUES (?, ?, ?, ?)
+                    """, (datetime.now().strftime("%Y-%m-%d"), name, float(amount), "USD"))
+                    count += 1
+            except:
+                continue
 
-    total = 0
+        conn.commit()
+        await update.message.reply_text(f"✅ **បានរក្សាទុក {count} ប្រតិបត្តិការ** ពី Statement XLSX រួចរាល់។")
 
-    report = "📊 របាយការណ៍\n\n"
+    except Exception as e:
+        await update.message.reply_text(f"❌ មានបញ្ហា៖ {str(e)}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
-    for name, amount in rows:
-
-        save_data(name, amount)
-
-        total += amount
-
-        report += (
-            f"👤 {name}: "
-            f"{amount:.2f}$\n"
-        )
-
-    report += (
-        f"\n💰 សរុប: {total:.2f}$"
-    )
-
-    await msg.edit_text(report)
-
-    os.remove(temp)
-
-# =========================
+# =========================================================
 # SUMMARY
-# =========================
-
-async def summary(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    conn = sqlite3.connect(DB_FILE)
-
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    SELECT sender, amount
-    FROM transfers
-    """)
-
+# =========================================================
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT sender_name, amount FROM transfers WHERE date = ? ORDER BY id", (today,))
     rows = cursor.fetchall()
 
-    conn.close()
-
     if not rows:
-
-        await update.message.reply_text(
-            "មិនមានទិន្នន័យ"
-        )
-
+        await update.message.reply_text("📊 ថ្ងៃនេះមិនទាន់មានការផ្ទេរ។")
         return
 
     total = 0
-
-    text = "📊 Summary\n\n"
-
-    for name, amount in rows:
-
+    msg = f"📊 **សរុបថ្ងៃនេះ ({today})**\n\n"
+    for i, (name, amt) in enumerate(rows, 1):
+        amount = Decimal(amt)
+        msg += f"{i}. {name} — {amount:,.2f} USD\n"
         total += amount
 
-        text += (
-            f"👤 {name}: "
-            f"{amount:.2f}$\n"
-        )
+    msg += f"\n━━━━━━━━━━━━━━\n"
+    msg += f"👥 សរុប {len(rows)} នាក់\n"
+    msg += f"💰 **សរុបទាំងអស់:** {total:,.2f} USD"
 
-    text += (
-        f"\n💰 សរុប: {total:.2f}$"
-    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
-    await update.message.reply_text(text)
-
-# =========================
-# START
-# =========================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "ផ្ញើ ABA Excel Statement"
-    )
-
-# =========================
+# =========================================================
 # MAIN
-# =========================
-
+# =========================================================
 def main():
+    app = Application.builder().token(TOKEN).build()
 
-    init_db()
+    app.add_handler(CommandHandler(["start", "summary", "today"], summary))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("ផ្ញើ Statement XLSX ឬសារធនាគារ មកខ្ញុំ")))
 
-    app = Application.builder().token(
-        TOKEN
-    ).build()
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "summary",
-            summary
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            receive_file
-        )
-    )
-
-    print("BOT RUNNING...")
-
+    print("🚀 Payway ABA Bot ដំណើរការរួចរាល់!")
     app.run_polling()
 
 if __name__ == "__main__":
