@@ -1,155 +1,611 @@
 import os
 import re
 import sqlite3
+import datetime
 import pandas as pd
-from decimal import Decimal
-from datetime import datetime
 
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
 
 # =========================================================
 # CONFIG
 # =========================================================
-TOKEN = os.getenv("BOT_TOKEN")
 
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN not found!")
+TOKEN = "PUT_YOUR_BOT_TOKEN"
+
+DB_FILE = "transactions.db"
 
 # =========================================================
 # DATABASE
 # =========================================================
-DB_FILE = "payway_bot.db"
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS transfers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    sender_name TEXT,
-    amount REAL,
-    currency TEXT
-)
-""")
-conn.commit()
+
+def init_db():
+
+    conn = sqlite3.connect(DB_FILE)
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS transfers (
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        transfer_date TEXT,
+        sender_name TEXT,
+        amount REAL,
+        currency TEXT,
+
+        UNIQUE(
+            transfer_date,
+            sender_name,
+            amount
+        )
+    )
+    """)
+
+    conn.commit()
+    conn.close()
 
 # =========================================================
-# PARSER (សម្រាប់សារ + XLSX)
+# SAVE TO DATABASE
 # =========================================================
-def parse_text(text: str):
-    transactions = []
-    lines = text.split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
 
-        # ស្រង់ទឹកប្រាក់
-        amount_match = re.search(r'ORIGINAL AMOUNT\s+([\d,]+\.?\d*)\s*USD', line, re.IGNORECASE)
-        if not amount_match:
-            amount_match = re.search(r'([\$៛])\s?([\d,]+(?:\.\d+)?)', line)
+def save_transaction(
+    transfer_date,
+    sender_name,
+    amount,
+    currency
+):
 
-        # ស្រង់ឈ្មោះ
-        name_match = re.search(r'FROM\s+(.+?)\s*\(', line, re.IGNORECASE)
-        if not name_match:
-            name_match = re.search(r'PAYMENT FROM\s+(.+?)\s', line, re.IGNORECASE)
-        if not name_match:
-            name_match = re.search(r'paid by\s+(.+?)\s', line, re.IGNORECASE)
+    conn = sqlite3.connect(DB_FILE)
 
-        if not amount_match or not name_match:
-            continue
-
-        amount_str = amount_match.group(1).replace(",", "") if 'ORIGINAL AMOUNT' in line else amount_match.group(2).replace(",", "")
-        name = name_match.group(1).strip()
-
-        try:
-            amount = Decimal(amount_str)
-            transactions.append({"name": name, "amount": amount, "currency": "USD"})
-        except:
-            continue
-    return transactions
-
-# =========================================================
-# HANDLE FILE XLSX
-# =========================================================
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
-    if not document.file_name.lower().endswith('.xlsx'):
-        await update.message.reply_text("❌ គាំទ្រតែ File .xlsx បច្ចុប្បន្ន។")
-        return
-
-    await update.message.reply_text("📥 កំពុងវិភាគ Statement...")
-
-    file = await context.bot.get_file(document.file_id)
-    temp_path = "temp.xlsx"
-    await file.download_to_drive(temp_path)
+    cursor = conn.cursor()
 
     try:
-        df = pd.read_excel(temp_path)
-        count = 0
 
-        for _, row in df.iterrows():
-            name = str(row.get('sender_name', row.get('Name', row.get(1, 'Unknown'))))
-            amount_str = str(row.get('amount', row.get('Amount', row.get(2, '0'))))
+        cursor.execute("""
+        INSERT INTO transfers (
 
-            amount_clean = re.sub(r'[^0-9.]', '', amount_str)
-            try:
-                amount = Decimal(amount_clean)
-                if amount > 0:
-                    cursor.execute("""
-                    INSERT INTO transfers (date, sender_name, amount, currency)
-                    VALUES (?, ?, ?, ?)
-                    """, (datetime.now().strftime("%Y-%m-%d"), name, float(amount), "USD"))
-                    count += 1
-            except:
-                continue
+            transfer_date,
+            sender_name,
+            amount,
+            currency
+
+        )
+        VALUES (?, ?, ?, ?)
+        """, (
+            transfer_date,
+            sender_name,
+            amount,
+            currency
+        ))
 
         conn.commit()
-        await update.message.reply_text(f"✅ **បានរក្សាទុក {count} ប្រតិបត្តិការ** ពី Statement XLSX រួចរាល់។")
+
+        saved = True
+
+    except:
+
+        saved = False
+
+    conn.close()
+
+    return saved
+
+# =========================================================
+# CLEAN TEXT
+# =========================================================
+
+def clean_text(text):
+
+    text = str(text)
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+# =========================================================
+# EXTRACT DATE
+# =========================================================
+
+def extract_date(text):
+
+    text = clean_text(text)
+
+    patterns = [
+
+        r'(\d{4}-\d{2}-\d{2})',
+
+        r'(\d{2}/\d{2}/\d{4})',
+
+        r'(\d{2}-\d{2}-\d{4})'
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(pattern, text)
+
+        if match:
+
+            raw = match.group(1)
+
+            try:
+
+                if "/" in raw:
+
+                    dt = datetime.datetime.strptime(
+                        raw,
+                        "%d/%m/%Y"
+                    )
+
+                elif raw.count("-") == 2:
+
+                    if len(raw.split("-")[0]) == 4:
+
+                        dt = datetime.datetime.strptime(
+                            raw,
+                            "%Y-%m-%d"
+                        )
+
+                    else:
+
+                        dt = datetime.datetime.strptime(
+                            raw,
+                            "%d-%m-%Y"
+                        )
+
+                return dt.strftime("%Y-%m-%d")
+
+            except:
+                pass
+
+    return datetime.datetime.now().strftime(
+        "%Y-%m-%d"
+    )
+
+# =========================================================
+# EXTRACT AMOUNT
+# =========================================================
+
+def extract_amount(text):
+
+    matches = re.findall(
+        r'(\d[\d,]*\.\d{2})',
+        text
+    )
+
+    amounts = []
+
+    for amt in matches:
+
+        try:
+
+            value = float(
+                amt.replace(",", "")
+            )
+
+            if value > 0:
+                amounts.append(value)
+
+        except:
+            pass
+
+    if not amounts:
+        return None
+
+    # យកលេខតូចជាងគេ
+    # ព្រោះ Balance ជាញឹកញាប់ធំជាង Amount
+
+    return min(amounts)
+
+# =========================================================
+# EXTRACT NAME
+# =========================================================
+
+def extract_name(text):
+
+    text = clean_text(text)
+
+    # Khmer name
+    kh_match = re.search(
+        r'([\u1780-\u17FF]{2,}(?:\s+[\u1780-\u17FF]{2,})+)',
+        text
+    )
+
+    if kh_match:
+
+        return kh_match.group(1)
+
+    # English Name
+    en_match = re.search(
+        r'([A-Z][a-z]+\s+[A-Z][a-z]+)',
+        text
+    )
+
+    if en_match:
+
+        return en_match.group(1)
+
+    return "Unknown"
+
+# =========================================================
+# DETECT CURRENCY
+# =========================================================
+
+def detect_currency(text):
+
+    text = text.upper()
+
+    if "KHR" in text or "៛" in text:
+        return "KHR"
+
+    return "USD"
+
+# =========================================================
+# PARSE FILE
+# =========================================================
+
+def parse_file(file_path):
+
+    results = []
+
+    try:
+
+        # Excel
+        if file_path.endswith((".xlsx", ".xls")):
+
+            df = pd.read_excel(
+                file_path,
+                engine="openpyxl",
+                header=None
+            )
+
+        # CSV
+        elif file_path.endswith(".csv"):
+
+            df = pd.read_csv(
+                file_path,
+                header=None
+            )
+
+        else:
+            return []
+
+        for _, row in df.iterrows():
+
+            row_text = " ".join([
+                str(x)
+                for x in row.values
+                if pd.notna(x)
+            ])
+
+            row_text = clean_text(row_text)
+
+            if len(row_text) < 5:
+                continue
+
+            amount = extract_amount(
+                row_text
+            )
+
+            if not amount:
+                continue
+
+            sender_name = extract_name(
+                row_text
+            )
+
+            transfer_date = extract_date(
+                row_text
+            )
+
+            currency = detect_currency(
+                row_text
+            )
+
+            results.append({
+
+                "date": transfer_date,
+
+                "name": sender_name,
+
+                "amount": amount,
+
+                "currency": currency
+
+            })
+
+        return results
 
     except Exception as e:
-        await update.message.reply_text(f"❌ មានបញ្ហា៖ {str(e)}")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+        print("PARSE ERROR:", e)
+
+        return []
+
+# =========================================================
+# RECEIVE FILE
+# =========================================================
+
+async def receive_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    doc = update.message.document
+
+    filename = doc.file_name.lower()
+
+    allowed = (
+        ".xlsx",
+        ".xls",
+        ".csv"
+    )
+
+    if not filename.endswith(allowed):
+
+        await update.message.reply_text(
+            "❌ សូមផ្ញើ .xlsx .xls ឬ .csv"
+        )
+
+        return
+
+    loading = await update.message.reply_text(
+        "⏳ កំពុងវិភាគ File..."
+    )
+
+    temp_file = f"temp_{doc.file_id}"
+
+    file = await context.bot.get_file(
+        doc.file_id
+    )
+
+    await file.download_to_drive(
+        temp_file
+    )
+
+    data = parse_file(temp_file)
+
+    if not data:
+
+        await loading.edit_text(
+            "❌ មិនអាចស្រង់ទិន្នន័យបាន"
+        )
+
+        return
+
+    report = "📊 របាយការណ៍\n\n"
+
+    total = 0
+    count = 0
+
+    for item in data:
+
+        saved = save_transaction(
+
+            item["date"],
+            item["name"],
+            item["amount"],
+            item["currency"]
+
+        )
+
+        if saved:
+
+            count += 1
+
+            total += item["amount"]
+
+            if item["currency"] == "USD":
+
+                report += (
+                    f"👤 {item['name']}: "
+                    f"{item['amount']:,.2f}$\n"
+                )
+
+            else:
+
+                report += (
+                    f"👤 {item['name']}: "
+                    f"{item['amount']:,.0f}៛\n"
+                )
+
+    report += (
+        "\n━━━━━━━━━━━━━━\n"
+    )
+
+    report += (
+        f"👥 ចំនួនអ្នកផ្ទេរ: {count}\n"
+    )
+
+    report += (
+        f"💰 សរុប: {total:,.2f}\n"
+    )
+
+    await loading.edit_text(report)
+
+    os.remove(temp_file)
 
 # =========================================================
 # SUMMARY
 # =========================================================
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("SELECT sender_name, amount FROM transfers WHERE date = ? ORDER BY id", (today,))
+
+async def summary(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if context.args:
+
+        target_date = context.args[0]
+
+    else:
+
+        target_date = datetime.datetime.now().strftime(
+            "%Y-%m-%d"
+        )
+
+    conn = sqlite3.connect(DB_FILE)
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT
+
+        sender_name,
+        amount,
+        currency
+
+    FROM transfers
+
+    WHERE transfer_date=?
+
+    ORDER BY amount ASC
+    """, (target_date,))
+
     rows = cursor.fetchall()
 
+    conn.close()
+
     if not rows:
-        await update.message.reply_text("📊 ថ្ងៃនេះមិនទាន់មានការផ្ទេរ។")
+
+        await update.message.reply_text(
+            f"❌ ថ្ងៃ {target_date} មិនមានទិន្នន័យ"
+        )
+
         return
 
-    total = 0
-    msg = f"📊 **សរុបថ្ងៃនេះ ({today})**\n\n"
-    for i, (name, amt) in enumerate(rows, 1):
-        amount = Decimal(amt)
-        msg += f"{i}. {name} — {amount:,.2f} USD\n"
-        total += amount
+    report = (
+        f"📊 ថ្ងៃ {target_date}\n"
+    )
 
-    msg += f"\n━━━━━━━━━━━━━━\n"
-    msg += f"👥 សរុប {len(rows)} នាក់\n"
-    msg += f"💰 **សរុបទាំងអស់:** {total:,.2f} USD"
+    report += (
+        "━━━━━━━━━━━━━━\n\n"
+    )
 
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    total_usd = 0
+    total_khr = 0
+
+    for name, amount, currency in rows:
+
+        amount = float(amount)
+
+        if currency == "USD":
+
+            total_usd += amount
+
+            report += (
+                f"👤 {name}: "
+                f"{amount:,.2f}$\n"
+            )
+
+        else:
+
+            total_khr += amount
+
+            report += (
+                f"👤 {name}: "
+                f"{amount:,.0f}៛\n"
+            )
+
+    report += (
+        "\n━━━━━━━━━━━━━━\n"
+    )
+
+    report += (
+        f"👥 អ្នកផ្ទេរ: {len(rows)}\n"
+    )
+
+    if total_usd > 0:
+
+        report += (
+            f"💰 USD: {total_usd:,.2f}$\n"
+        )
+
+    if total_khr > 0:
+
+        report += (
+            f"💰 KHR: {total_khr:,.0f}៛\n"
+        )
+
+    await update.message.reply_text(
+        report
+    )
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = """
+🤖 ABA STATEMENT BOT
+
+📥 Support:
+• .xlsx
+• .xls
+• .csv
+
+📊 Commands:
+
+/summary
+
+ឬ
+
+/summary 2026-05-08
+"""
+
+    await update.message.reply_text(text)
 
 # =========================================================
 # MAIN
 # =========================================================
+
 def main():
-    app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler(["start", "summary", "today"], summary))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("ផ្ញើ Statement XLSX ឬសារធនាគារ មកខ្ញុំ")))
+    init_db()
 
-    print("🚀 Payway ABA Bot ដំណើរការរួចរាល់!")
+    app = Application.builder().token(
+        TOKEN
+    ).build()
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "summary",
+            summary
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            receive_file
+        )
+    )
+
+    print("🚀 BOT RUNNING...")
+
     app.run_polling()
 
+# =========================================================
+
 if __name__ == "__main__":
+
     main()
